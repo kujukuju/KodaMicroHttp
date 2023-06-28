@@ -6,6 +6,10 @@ HttpServer :: struct {
     daemon: *MHD_Daemon;
     handlers: [http_method_count] Table(string, RequestHandler);
     extra_headers: [] [2] *u8;
+    // once this is flipped to true we'll no longer lock the mutex since the table will never again change
+    threads_propagated: bool;
+    thread_contexts_mutex: Mutex;
+    thread_contexts: Table(u64, Context);
 }
 
 HttpRequest :: struct {
@@ -13,6 +17,7 @@ HttpRequest :: struct {
 }
 
 HttpResponse :: struct {
+    server: *HttpServer;
     connection: *MHD_Connection;
     extra_headers: [] [2] *u8;
 }
@@ -51,13 +56,16 @@ create_server :: (port: u16, timeout_seconds: int = 60, thread_count: int = core
     server.timeout_seconds = timeout_seconds;
     server.thread_count = thread_count;
 
+    init(*server.thread_contexts_mutex);
+
     return server;
 }
 
-free_server :: (server: *HttpServer) {
+destroy_server :: (server: *HttpServer) {
     for *handler: server.handlers {
         deinit(handler);
     }
+    destroy(*server.thread_contexts_mutex);
     // not sure if the daemon has to be freed, I don't think so
     free(server);
 }
@@ -75,6 +83,8 @@ server_listen :: (server: *HttpServer) {
 }
 
 server_listen_async :: (server: *HttpServer) -> bool {
+    init(*server.thread_contexts, server.thread_count);
+
     server.daemon = MHD_start_daemon(
         cast(u32) MHD_FLAG.MHD_USE_INTERNAL_POLLING_THREAD,
         server.port,
@@ -91,6 +101,18 @@ server_listen_async :: (server: *HttpServer) -> bool {
     // TODO clear the temp allocator for each context (if its even unique?) after each request
 
     return server.daemon != null;
+}
+
+server_stop :: (server: *HttpServer) {
+    print("Stopping server on port %...\n", server.port);
+
+    MHD_stop_daemon(server.daemon);
+
+    for thread_context, thread_id: server.thread_contexts {
+        free_thread_context(thread_context);
+    }
+    deinit(*server.thread_contexts);
+    server.threads_propagated = false;
 }
 
 handle :: (server: *HttpServer, method: HttpMethod, $path: string, handler: RequestHandler) {
@@ -119,7 +141,7 @@ reply :: (response: *HttpResponse, status: u16, extra_headers: [] [2] *u8, body_
         case .Static;
             mhd_response = MHD_create_response_from_buffer_static(body_length, body);
         case .Allocated;
-            mhd_response = MHD_create_response_from_buffer_with_free_callback(body_length, body, memory_free_callback);
+            mhd_response = MHD_create_response_from_buffer_with_free_callback_cls(body_length, body, memory_free_callback, cast(*void) response.server);
         case .Copy;
             mhd_response = MHD_create_response_from_buffer_copy(body_length, body);
     }
@@ -144,22 +166,88 @@ reply :: (response: *HttpResponse, status: u16, extra_headers: [] [2] *u8, body_
 
 #scope_file
 
-memory_free_callback :: (cls: *void) #c_call {
-    push_context server_context_BAD_DONT_USE_NOT_THREAD_SAFE {
-        free(cls);
+get_thread_context :: (server: *HttpServer) -> Context #c_call {
+    push_context global_http_context {
+        thread_id := get_thread_id();
+
+        threads_propagated := server.threads_propagated;
+        if !threads_propagated {
+            lock(*server.thread_contexts_mutex);
+        }
+
+        thread_context_pointer := table_find_pointer(*server.thread_contexts, thread_id);
+        if !thread_context_pointer {
+            thread_context_pointer = table_add(*server.thread_contexts, thread_id, create_thread_context(thread_id));
+        }
+
+        if !threads_propagated {
+            threads_propagated = server.thread_contexts.count >= server.thread_count;
+            unlock(*server.thread_contexts_mutex);
+        }
+
+        return thread_context_pointer.*;
     }
 }
 
-// get_memory_mode :: (memory_mode: HttpMemoryMode) -> MHD_ResponseMemoryMode {
-//     if #complete memory_mode == {
-//         case .Static;
-//             return .PERSISTENT;
-//         case .Allocated;
-//             return .MUST_FREE;
-//         case .Copy;
-//             return .MUST_COPY;
-//     }
-// }
+create_thread_context :: (thread_id: u64) -> Context {
+    truncated_thread_id: u32;
+    truncated_thread_id = (cast(u32) (thread_id & 0xffffffff)) ^ (cast(u32) ((thread_id >> 32) & 0xffffffff));
+
+    temporary_storage_size := 16384;
+
+    thread_context: Context;
+    thread_context.thread_index = truncated_thread_id;
+    thread_context.base.context_info = type_info(Context);
+    thread_context.allocator = global_http_context.allocator;
+    thread_context.logger = global_http_context.logger;
+    thread_context.logger_data = global_http_context.logger_data;
+    thread_context.temporary_storage = New(Temporary_Storage);
+    set_initial_data(thread_context.temporary_storage, temporary_storage_size, alloc(temporary_storage_size));
+
+    return thread_context;
+}
+
+free_thread_context :: (thread_context: Context) {
+    push_context global_http_context {
+        free(thread_context.temporary_storage.original_data);
+
+        overflow := thread_context.temporary_storage.overflow_pages;
+        while overflow {
+            free(overflow);
+            overflow = overflow.next;
+        }
+    }
+}
+
+get_thread_id :: () -> u64 {
+    #if OS == .WINDOWS {
+        #import "Windows";
+        
+        return cast(u64) GetCurrentThreadId();
+    } else #if OS == .LINUX {
+        #import "POSIX";
+
+        return pthread_self();
+    } else #if OS == .MACOS {
+        #import "POSIX";
+
+        thread_id: u64;
+        pthread_threadid_np(null, *thread_id);
+        return thread_id;
+    } else {
+        assert(false, "Unknown OS.");
+        return 0;
+    }
+}
+
+memory_free_callback :: (cls: *void) #c_call {
+    server := cast(*HttpServer) cls;
+    thread_context := get_thread_context(server);
+
+    push_context thread_context {
+        free(cls);
+    }
+}
 
 normalize_url :: (url: string) -> string {
     normalized := url;
@@ -202,15 +290,16 @@ get_http_method :: (method: string) -> HttpMethod {
 }
 
 server_respond :: (cls: *void, connection: *MHD_Connection, url: *u8, method: *u8, version: *u8, upload_data: *u8, upload_data_size: *u64, req_cls: **void) -> MHD_Result #c_call {
-    // TODO swap out context based on unique thread stuff so I can clear temp storage after this
+    server := cast(*HttpServer) cls;
+    thread_context := get_thread_context(server);
 
-    push_context server_context_BAD_DONT_USE_NOT_THREAD_SAFE {
-        server := cast(*HttpServer) cls;
+    push_context thread_context {
         url_string := normalize_url(to_string(url));
         method_string := to_string(method);
 
         http_request := HttpRequest.{};
         http_response := HttpResponse.{
+            server,
             connection,
             server.extra_headers,
         };
@@ -231,16 +320,25 @@ server_respond :: (cls: *void, connection: *MHD_Connection, url: *u8, method: *u
             handler = *default_not_found_handler;
         }
 
+        reset_temporary_storage();
+
         http_result := handler.*(*http_request, *http_response);
         return http_result.result;
     }
 }
 
-server_context_BAD_DONT_USE_NOT_THREAD_SAFE: Context;
+global_http_context: Context;
 
 default_not_found_handler := (request: *HttpRequest, response: *HttpResponse) -> HttpResult {
     return reply(response, 404, .[], "");
 }
+
+// finished_propagating_contexts: bool;
+// required_thread_count: int;
+// thread_contexts_mutex_initialized: bool;
+// thread_contexts_mutex: Mutex;
+
+// thread_contexts: Table(u64, Context);
 
 core_count :: #run get_number_of_processors();
 core_thread_count :: core_count * 2;
