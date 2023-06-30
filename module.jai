@@ -117,7 +117,7 @@ server_stop :: (server: *HttpServer) {
     MHD_stop_daemon(server.daemon);
 
     for thread_context, thread_id: server.thread_contexts {
-        free_thread_context(thread_context);
+        free_thread_context(server, thread_context);
     }
     deinit(*server.thread_contexts);
     server.threads_propagated = false;
@@ -206,6 +206,8 @@ get_form_data :: (request: *HttpRequest, name: string) -> *string {
 
 get_thread_context :: (server: *HttpServer) -> Context #c_call {
     push_context global_http_context {
+        context.allocator = server.allocator;
+
         thread_id := get_thread_id();
 
         threads_propagated := server.threads_propagated;
@@ -243,8 +245,10 @@ create_thread_context :: (server: *HttpServer, thread_id: u64) -> Context {
     return thread_context;
 }
 
-free_thread_context :: (thread_context: Context) {
+free_thread_context :: (server: *HttpServer, thread_context: Context) {
     push_context global_http_context {
+        context.allocator = server.allocator;
+
         free(thread_context.temporary_storage.original_data);
 
         overflow := thread_context.temporary_storage.overflow_pages;
@@ -416,8 +420,9 @@ server_respond :: (cls: *void, connection: *MHD_Connection, url: *u8, method: *u
 }
 
 iterate_post :: (cls: *void, kind: MHD_ValueKind, key: *u8, filename: *u8, content_type: *u8, transfer_encoding: *u8, data: *u8, off: u64, size: size_t) -> MHD_Result #c_call {
+    http_request := cast(*HttpRequest) cls;
+
     push_context global_http_context {
-        http_request := cast(*HttpRequest) cls;
         context.allocator = http_request.server.allocator;
 
         key_string := to_string(key);
@@ -457,8 +462,9 @@ iterate_post :: (cls: *void, kind: MHD_ValueKind, key: *u8, filename: *u8, conte
 }
 
 server_completed :: (cls: *void, connection: *MHD_Connection, req_cls: **void, toe: MHD_RequestTerminationCode) #c_call {
+    http_request := cast(*HttpRequest) req_cls.*;
+
     push_context global_http_context {
-        http_request := cast(*HttpRequest) req_cls.*;
         context.allocator = http_request.server.allocator;
 
         if !http_request {
