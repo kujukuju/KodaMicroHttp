@@ -10,16 +10,25 @@ HttpServer :: struct {
     threads_propagated: bool;
     thread_contexts_mutex: Mutex;
     thread_contexts: Table(u64, Context);
+    allocator: Allocator;
+}
+
+HttpFormEntry :: struct {
+    name: string;
+    filename: string;
+    value: string;
 }
 
 HttpRequest :: struct {
-    
+    server: *HttpServer;
+    form_data: [..] HttpFormEntry;
+    post_processor: *MHD_PostProcessor;
+    error: bool;
 }
 
 HttpResponse :: struct {
     server: *HttpServer;
     connection: *MHD_Connection;
-    extra_headers: [] [2] *u8;
 }
 
 HttpResult :: struct {
@@ -50,11 +59,12 @@ HttpMemoryMode :: enum u16 {
 
 RequestHandler :: #type (request: *HttpRequest, response: *HttpResponse) -> HttpResult;
 
-create_server :: (port: u16, timeout_seconds: int = 60, thread_count: int = core_thread_count) -> *HttpServer {
+create_server :: (port: u16, timeout_seconds: int = 60, thread_count: int = core_count) -> *HttpServer {
     server := New(HttpServer);
     server.port = port;
     server.timeout_seconds = timeout_seconds;
     server.thread_count = thread_count;
+    server.allocator = context.allocator;
 
     init(*server.thread_contexts_mutex);
 
@@ -86,25 +96,23 @@ server_listen_async :: (server: *HttpServer) -> bool {
     init(*server.thread_contexts, server.thread_count);
 
     server.daemon = MHD_start_daemon(
-        cast(u32) MHD_FLAG.MHD_USE_INTERNAL_POLLING_THREAD,
+        cast(u32) (MHD_FLAG.MHD_USE_INTERNAL_POLLING_THREAD | .USE_AUTO),
         server.port,
         null,
         null,
         server_respond,
         cast(*void) server,
+        MHD_OPTION.MHD_OPTION_NOTIFY_COMPLETED, server_completed, null,
+        MHD_OPTION.MHD_OPTION_CONNECTION_MEMORY_LIMIT, cast(u64) (256 * 1024),
         MHD_OPTION.MHD_OPTION_THREAD_POOL_SIZE, server.thread_count,
         MHD_OPTION.MHD_OPTION_CONNECTION_TIMEOUT, server.timeout_seconds,
         MHD_OPTION.MHD_OPTION_END);
-
-    // TODO I can't figure out how to assert on temp allocations so I'll
-    // TODO just have to actually give a new context to each thread and
-    // TODO clear the temp allocator for each context (if its even unique?) after each request
 
     return server.daemon != null;
 }
 
 server_stop :: (server: *HttpServer) {
-    print("Stopping server on port %...\n", server.port);
+    print("Stopping server on port %.\n", server.port);
 
     MHD_stop_daemon(server.daemon);
 
@@ -119,38 +127,54 @@ handle :: (server: *HttpServer, method: HttpMethod, $path: string, handler: Requ
     table_set(*server.handlers[cast(u16) method], normalize_url(path), handler);
 }
 
-reply :: (response: *HttpResponse, status: u16, extra_headers: [] [2] *u8, $body: string) -> HttpResult {
-    return inline reply(response, status, extra_headers, body, .Static);
-}
-
 reply :: (response: *HttpResponse, status: u16, extra_headers: [] [2] *u8, body: string, memory_mode: HttpMemoryMode) -> HttpResult {
     assert(body.count == 0 || body[body.count - 1] == #char "\0", "Your body must either be null or must end with a null character.");
 
-    body_count: u64;
+    body_count: int;
     if body.count > 0 {
-        body_count = cast(u64) body.count - 1;
+        body_count = body.count - 1;
     }
 
-    return inline reply(response, status, extra_headers, body_count, body.data, memory_mode);
+    return inline reply(response, status, extra_headers, body.data, body_count, memory_mode);
 }
 
-reply :: (response: *HttpResponse, status: u16, extra_headers: [] [2] *u8, body_length: u64, body: *u8, memory_mode: HttpMemoryMode) -> HttpResult {
-    body_length := cast(u64) c_style_strlen(body);
+reply :: (response: *HttpResponse, status: u16, extra_headers: [] [2] *u8, $body: *u8) -> HttpResult {
+    body_count :: #run (body: *u8) -> int {
+        if !body {
+            return 0;
+        }
+
+        return c_style_strlen(body);
+    }(body);
+
+    return inline reply(response, status, extra_headers, body, body_count, .Static);
+}
+
+reply :: (response: *HttpResponse, status: u16, extra_headers: [] [2] *u8, body: *u8, memory_mode: HttpMemoryMode) -> HttpResult {
+    body_count: int;
+    if body {
+        body_count = c_style_strlen(body);
+    }
+
+    return inline reply(response, status, extra_headers, body, body_count, memory_mode);
+}
+
+reply :: (response: *HttpResponse, status: u16, extra_headers: [] [2] *u8, body: *u8, body_length: int, memory_mode: HttpMemoryMode) -> HttpResult {
     mhd_response: *MHD_Response;
     if #complete memory_mode == {
         case .Static;
-            mhd_response = MHD_create_response_from_buffer_static(body_length, body);
+            mhd_response = MHD_create_response_from_buffer_static(cast(u64) body_length, body);
         case .Allocated;
-            mhd_response = MHD_create_response_from_buffer_with_free_callback_cls(body_length, body, memory_free_callback, cast(*void) response.server);
+            mhd_response = MHD_create_response_from_buffer_with_free_callback_cls(cast(u64) body_length, body, memory_free_callback, cast(*void) response.server);
         case .Copy;
-            mhd_response = MHD_create_response_from_buffer_copy(body_length, body);
+            mhd_response = MHD_create_response_from_buffer_copy(cast(u64) body_length, body);
     }
 
     if !mhd_response {
         return .{.MHD_NO};
     }
 
-    for extra_header: response.extra_headers {
+    for extra_header: response.server.extra_headers {
         MHD_add_response_header(mhd_response, extra_header[0], extra_header[1]);
     }
 
@@ -162,6 +186,20 @@ reply :: (response: *HttpResponse, status: u16, extra_headers: [] [2] *u8, body_
     MHD_destroy_response(mhd_response);
 
     return .{ret};
+}
+
+reply_error :: () -> HttpResult {
+    return .{MHD_NO};
+}
+
+get_form_data :: (request: *HttpRequest, name: string) -> *string {
+    for entry: request.form_data {
+        if entry.name == name {
+            return *entry.value;
+        }
+    }
+
+    return null;
 }
 
 #scope_file
@@ -177,7 +215,7 @@ get_thread_context :: (server: *HttpServer) -> Context #c_call {
 
         thread_context_pointer := table_find_pointer(*server.thread_contexts, thread_id);
         if !thread_context_pointer {
-            thread_context_pointer = table_add(*server.thread_contexts, thread_id, create_thread_context(thread_id));
+            thread_context_pointer = table_add(*server.thread_contexts, thread_id, create_thread_context(server, thread_id));
         }
 
         if !threads_propagated {
@@ -189,7 +227,7 @@ get_thread_context :: (server: *HttpServer) -> Context #c_call {
     }
 }
 
-create_thread_context :: (thread_id: u64) -> Context {
+create_thread_context :: (server: *HttpServer, thread_id: u64) -> Context {
     truncated_thread_id: u32;
     truncated_thread_id = (cast(u32) (thread_id & 0xffffffff)) ^ (cast(u32) ((thread_id >> 32) & 0xffffffff));
 
@@ -198,9 +236,7 @@ create_thread_context :: (thread_id: u64) -> Context {
     thread_context: Context;
     thread_context.thread_index = truncated_thread_id;
     thread_context.base.context_info = type_info(Context);
-    thread_context.allocator = global_http_context.allocator;
-    thread_context.logger = global_http_context.logger;
-    thread_context.logger_data = global_http_context.logger_data;
+    thread_context.allocator = server.allocator;
     thread_context.temporary_storage = New(Temporary_Storage);
     set_initial_data(thread_context.temporary_storage, temporary_storage_size, alloc(temporary_storage_size));
 
@@ -290,58 +326,199 @@ get_http_method :: (method: string) -> HttpMethod {
 }
 
 server_respond :: (cls: *void, connection: *MHD_Connection, url: *u8, method: *u8, version: *u8, upload_data: *u8, upload_data_size: *u64, req_cls: **void) -> MHD_Result #c_call {
+    request_time := get_unix_time();
     server := cast(*HttpServer) cls;
     thread_context := get_thread_context(server);
 
     push_context thread_context {
         url_string := normalize_url(to_string(url));
         method_string := to_string(method);
+        http_method := get_http_method(method_string);
 
-        http_request := HttpRequest.{};
+        http_request := cast(*HttpRequest) req_cls.*;
         http_response := HttpResponse.{
             server,
             connection,
-            server.extra_headers,
         };
 
-        http_method := get_http_method(method_string);
-        handler := table_find_pointer(*server.handlers[cast(u16) http_method], url_string);
+        if !http_request {
+            http_request = New(HttpRequest);
+            req_cls.* = http_request;
+
+            if !http_request {
+                return .MHD_NO;
+            }
+            
+            http_request.server = server;
+        }
+
+        // if it's a post method we have to propagate the form data
+        if http_method == .Post {
+            if !http_request.post_processor {
+                http_request.post_processor = MHD_create_post_processor(connection, 1024, iterate_post, cast(*void) http_request);
+                if !http_request.post_processor {
+                    req_cls.* = null;
+                    free(http_request);
+
+                    return .MHD_NO;
+                }
+
+                return .MHD_YES;
+            }
+
+            if upload_data_size.* != 0 {
+                // if we've already received an error then we give up on post processing and just keep iterating until we're done
+                if http_request.error {
+                    upload_data_size.* = 0;
+
+                    return .MHD_YES;
+                }
+
+                if MHD_post_process(http_request.post_processor, upload_data, upload_data_size.*) != .MHD_YES {
+                    http_request.error = true;
+                }
+
+                upload_data_size.* = 0;
+                return .MHD_YES;
+            }
+        }
+
+        // TODO need to remove all duplicate slashes and trailing slashes, and maybe store each / part as its own thing so I can match wildcards
+
+        handler := table_find_pointer(*server.handlers[cast(int) http_method], url_string);
         if !handler {
-            handler = table_find_pointer(*server.handlers[cast(u16) http_method], "*");
+            handler = table_find_pointer(*server.handlers[cast(int) http_method], "*");
+        }
+        if !handler && http_method == .Head {
+            // libmicrohttpd automatically handles removing the body so we'll fallback to get requests without any extra data
+            handler = table_find_pointer(*server.handlers[cast(int) HttpMethod.Get], url_string);
+            if !handler {
+                handler = table_find_pointer(*server.handlers[cast(int) HttpMethod.Get], "*");
+            }
         }
         if !handler {
-            handler = table_find_pointer(*server.handlers[cast(u16) HttpMethod.Fallback], url_string);
+            handler = table_find_pointer(*server.handlers[cast(int) HttpMethod.Fallback], url_string);
         }
         if !handler {
-            handler = table_find_pointer(*server.handlers[cast(u16) HttpMethod.Fallback], "*");
+            handler = table_find_pointer(*server.handlers[cast(int) HttpMethod.Fallback], "*");
         }
         if !handler {
             print("No valid fallback found. Begrudgingly returning 404.\n");
             handler = *default_not_found_handler;
         }
 
+        http_result := handler.*(http_request, *http_response);
+
         reset_temporary_storage();
 
-        http_result := handler.*(*http_request, *http_response);
         return http_result.result;
+    }
+}
+
+iterate_post :: (cls: *void, kind: MHD_ValueKind, key: *u8, filename: *u8, content_type: *u8, transfer_encoding: *u8, data: *u8, off: u64, size: size_t) -> MHD_Result #c_call {
+    push_context global_http_context {
+        http_request := cast(*HttpRequest) cls;
+        context.allocator = http_request.server.allocator;
+
+        key_string := to_string(key);
+
+        existing_entry: *HttpFormEntry;
+        for *entry: http_request.form_data {
+            if entry.name == key_string {
+                existing_entry = entry;
+                break;
+            }
+        }
+
+        if !existing_entry {
+            existing_entry = array_add(*http_request.form_data);
+            if !existing_entry {
+                return .MHD_NO;
+            }
+
+            existing_entry.name = copy_string(key_string);
+            if filename {
+                existing_entry.filename = copy_string(to_string(filename));
+            }
+        }
+
+        if size > 0 {
+            if !existing_entry.value.data {
+                existing_entry.value.data = alloc(cast(int) size);
+            } else {
+                existing_entry.value.data = realloc(existing_entry.value.data, existing_entry.value.count + cast(int) size, existing_entry.value.count);
+            }
+            memcpy(existing_entry.value.data + existing_entry.value.count, data, cast(int) size);
+            existing_entry.value.count += cast(int) size;
+        }
+
+        return .MHD_YES;
+    }
+}
+
+server_completed :: (cls: *void, connection: *MHD_Connection, req_cls: **void, toe: MHD_RequestTerminationCode) #c_call {
+    push_context global_http_context {
+        http_request := cast(*HttpRequest) req_cls.*;
+        context.allocator = http_request.server.allocator;
+
+        if !http_request {
+            return;
+        }
+
+        for entry: http_request.form_data {
+            free(entry.name);
+            free(entry.filename);
+            free(entry.value);
+        }
+        array_free(http_request.form_data);
+
+        if http_request.post_processor {
+            MHD_destroy_post_processor(http_request.post_processor);
+        }
+
+        free(http_request);
+
+        req_cls.* = null;
+    }
+}
+
+get_unix_time :: () -> u64 #c_call {
+    #if OS == .WINDOWS {
+        #import "Windows";
+
+        filetime: FILETIME;
+        GetSystemTimePreciseAsFileTime(*filetime);
+
+        UNIX_TIME_START: s64 : 0x019DB1DED53E8000;
+        TICKS_PER_SECOND: s64 : 10000;
+
+        li: LARGE_INTEGER;
+        li.LowPart = xx filetime.dwLowDateTime;
+        li.HighPart = xx filetime.dwHighDateTime;
+
+        return cast(u64) ((li.QuadPart - UNIX_TIME_START) / TICKS_PER_SECOND);
+    } else #if OS == .LINUX {
+        #import "POSIX";
+
+        t: timespec;
+        clock_gettime(CLOCK_REALTIME, *t);
+        micros: s64 = t.tv_sec * 1000000;
+        /* Add full microseconds */
+        micros += t.tv_nsec / 1000;
+
+        return cast(u64) micros / 1000;
+    } else {
+        return 0;
     }
 }
 
 global_http_context: Context;
 
 default_not_found_handler := (request: *HttpRequest, response: *HttpResponse) -> HttpResult {
-    return reply(response, 404, .[], "");
+    return reply(response, 404, .[], null);
 }
 
-// finished_propagating_contexts: bool;
-// required_thread_count: int;
-// thread_contexts_mutex_initialized: bool;
-// thread_contexts_mutex: Mutex;
-
-// thread_contexts: Table(u64, Context);
-
 core_count :: #run get_number_of_processors();
-core_thread_count :: core_count * 2;
 http_method_count :: cast(u16) HttpMethod.Fallback + 1;
 
 #import "libmicrohttpd-jai";
