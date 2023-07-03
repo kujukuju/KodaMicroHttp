@@ -4,7 +4,9 @@ HttpServer :: struct {
     timeout_seconds: int;
     thread_count: int;
     daemon: *MHD_Daemon;
-    handlers: [http_method_count] Table(string, RequestHandler);
+    static_handlers: [http_method_count] Table(string, RequestHandler);
+    optional_handlers: [http_method_count] Table(string, RequestHandlerWithOptions);
+    fallback_handlers: [http_method_count] RequestHandler;
     extra_headers: [] [2] *u8;
     // once this is flipped to true we'll no longer lock the mutex since the table will never again change
     threads_propagated: bool;
@@ -58,6 +60,7 @@ HttpMemoryMode :: enum u16 {
 }
 
 RequestHandler :: #type (request: *HttpRequest, response: *HttpResponse) -> HttpResult;
+RequestHandlerWithOptions :: #type (request: *HttpRequest, response: *HttpResponse, path_fields: ..string) -> HttpResult;
 
 create_server :: (port: u16, timeout_seconds: int = 60, thread_count: int = core_count) -> *HttpServer {
     server := New(HttpServer);
@@ -72,7 +75,7 @@ create_server :: (port: u16, timeout_seconds: int = 60, thread_count: int = core
 }
 
 destroy_server :: (server: *HttpServer) {
-    for *handler: server.handlers {
+    for *handler: server.static_handlers {
         deinit(handler);
     }
     destroy(*server.thread_contexts_mutex);
@@ -124,7 +127,11 @@ server_stop :: (server: *HttpServer) {
 }
 
 handle :: (server: *HttpServer, method: HttpMethod, $path: string, handler: RequestHandler) {
-    table_set(*server.handlers[cast(u16) method], normalize_url(path), handler);
+    table_set(*server.static_handlers[cast(u16) method], normalize_url(path), handler);
+}
+
+handle :: (server: *HttpServer, method: HttpMethod, $path: string, handler: RequestHandlerWithOptions) {
+
 }
 
 reply :: (response: *HttpResponse, status: u16, extra_headers: [] [2] *u8, body: string, memory_mode: HttpMemoryMode) -> HttpResult {
@@ -389,22 +396,28 @@ server_respond :: (cls: *void, connection: *MHD_Connection, url: *u8, method: *u
 
         // TODO need to remove all duplicate slashes and trailing slashes, and maybe store each / part as its own thing so I can match wildcards
 
-        handler := table_find_pointer(*server.handlers[cast(int) http_method], url_string);
+        handler := table_find_pointer(*server.static_handlers[cast(int) http_method], url_string);
         if !handler {
-            handler = table_find_pointer(*server.handlers[cast(int) http_method], "*");
+            handler = table_find_pointer(*server.optional_handlers[cast(int) http_method], url_string);
+        }
+        if !handler {
+            handler = server.fallback_handlers[cast(int) http_method];
         }
         if !handler && http_method == .Head {
             // libmicrohttpd automatically handles removing the body so we'll fallback to get requests without any extra data
-            handler = table_find_pointer(*server.handlers[cast(int) HttpMethod.Get], url_string);
+            handler = table_find_pointer(*server.static_handlers[cast(int) HttpMethod.Get], url_string);
             if !handler {
-                handler = table_find_pointer(*server.handlers[cast(int) HttpMethod.Get], "*");
+                handler = table_find_pointer(*server.optional_handlers[cast(int) HttpMethod.Get], url_string);
+            }
+            if !handler {
+                handler = server.fallback_handlers[cast(int) HttpMethod.Get];
             }
         }
         if !handler {
-            handler = table_find_pointer(*server.handlers[cast(int) HttpMethod.Fallback], url_string);
+            handler = table_find_pointer(*server.static_handlers[cast(int) HttpMethod.Fallback], url_string);
         }
         if !handler {
-            handler = table_find_pointer(*server.handlers[cast(int) HttpMethod.Fallback], "*");
+            handler = table_find_pointer(*server.static_handlers[cast(int) HttpMethod.Fallback], "*");
         }
         if !handler {
             print("No valid fallback found. Begrudgingly returning 404.\n");
