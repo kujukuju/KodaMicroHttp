@@ -4,8 +4,8 @@ HttpServer :: struct {
     timeout_seconds: int;
     thread_count: int;
     daemon: *MHD_Daemon;
-    static_handlers: [http_method_count] Table(string, RequestHandler);
-    optional_handlers: [http_method_count] Table(string, RequestHandlerWithOptions);
+    handlers: [http_method_count] HttpHandler;
+    // optional_handlers: [http_method_count] [..] HttpHandlerWithOptions;
     fallback_handlers: [http_method_count] RequestHandler;
     extra_headers: [] [2] *u8;
     // once this is flipped to true we'll no longer lock the mutex since the table will never again change
@@ -14,6 +14,23 @@ HttpServer :: struct {
     thread_contexts: Table(u64, Context);
     allocator: Allocator;
 }
+
+HttpHandler :: struct {
+    part: string;
+    children: [..] HttpHandler;
+    optional: *HttpHandler;
+    union {
+        callback: RequestHandler;
+        callback_with_options: RequestHandlerWithOptions;
+    }
+}
+
+// HttpHandlerWithOptions :: struct {
+//     part: string;
+//     children: [..] HttpHandlerWithOptions;
+//     fallback: HttpHandlerWithOptions;
+//     callback: RequestHandlerWithOptions;
+// }
 
 HttpFormEntry :: struct {
     name: string;
@@ -25,6 +42,7 @@ HttpRequest :: struct {
     server: *HttpServer;
     form_data: [..] HttpFormEntry;
     post_processor: *MHD_PostProcessor;
+    content_type: string;
     error: bool;
 }
 
@@ -75,8 +93,8 @@ create_server :: (port: u16, timeout_seconds: int = 60, thread_count: int = core
 }
 
 destroy_server :: (server: *HttpServer) {
-    for *handler: server.static_handlers {
-        deinit(handler);
+    for handler: server.handlers {
+        destroy_handler(handler);
     }
     destroy(*server.thread_contexts_mutex);
     // not sure if the daemon has to be freed, I don't think so
@@ -126,12 +144,28 @@ server_stop :: (server: *HttpServer) {
     server.threads_propagated = false;
 }
 
-handle :: (server: *HttpServer, method: HttpMethod, $path: string, handler: RequestHandler) {
-    table_set(*server.static_handlers[cast(u16) method], normalize_url(path), handler);
+handle :: (server: *HttpServer, method: HttpMethod, $path: string, $handler: RequestHandler) {
+    #run assert(starts_with(path, "/") || starts_with(path, "*"), "Your handler path must start with either \"/\" or \"*\".");
+    // #run assert(find_index_from_left(path, #char "*") <= 0, "You cannot provide optional paths in your static request handler.");
+
+    #if path == "*" {
+        server.fallback_handlers[cast(int) method] = handler;
+    } else {
+        final_handler := add_handler(*server.handlers[cast(int) method], path);
+        assert(!final_handler.callback, "You cannot override an existing handler callback.");
+        final_handler.callback = handler;
+    }
 }
 
-handle :: (server: *HttpServer, method: HttpMethod, $path: string, handler: RequestHandlerWithOptions) {
+handle :: (server: *HttpServer, method: HttpMethod, $path: string, $handler: RequestHandlerWithOptions) {
+    #run assert(starts_with(path, "/"), "Your handler path must start with either \"/\" or \"*\".");
+    #run assert(find_index_from_left(path, #char "*") > 0, "You cannot provide static paths in your optional request handler.");
 
+    // TODO match the number of optionals to the number of vargs
+
+    final_handler := add_handler(*server.handlers[cast(int) method], path);
+    assert(!final_handler.callback_with_options, "You cannot override an existing handler callback.");
+    final_handler.callback_with_options = handler;
 }
 
 reply :: (response: *HttpResponse, status: u16, extra_headers: [] [2] *u8, body: string, memory_mode: HttpMemoryMode) -> HttpResult {
@@ -210,6 +244,155 @@ get_form_data :: (request: *HttpRequest, name: string) -> *string {
 }
 
 #scope_file
+
+destroy_handler :: (handler: HttpHandler) {
+    // we don't free the part string because it's just a segment of a compile time string
+    // we also don't free any handlers because they're just pointers to global functions
+    for child: handler.children {
+        destroy_handler(child);
+    }
+
+    if handler.optional {
+        destroy_handler(handler.optional);
+        free(handler.optional);
+    }
+
+    array_free(handler.children);
+}
+
+get_handler :: (handler: *HttpHandler, path: string) -> *HttpHandler {
+    if !path {
+        return null;
+    }
+
+    // check if this is a base path, nothing or slashes
+    path_part, next_index := get_next_path_part(path, 0);
+    if !path_part && next_index == path.count {
+        return handler;
+    }
+
+    next_handler: *HttpHandler = handler;
+
+    index := 0;
+    while index < path.count && next_handler {
+        path_part, next_index := get_next_path_part(path, index);
+
+        if path_part {
+            static_handler := get_static_handler(*next_handler.children, path_part);
+            if static_handler {
+                next_handler = static_handler;
+            } else {
+                next_handler = next_handler.optional;
+            }
+        }
+
+        index = next_index;
+    }
+
+    return next_handler;
+}
+
+add_handler :: (handler: *HttpHandler, $path: string) -> *HttpHandler {
+    #if path[0] == #char "*" {
+        return handler;
+    }
+
+    current_handler: *HttpHandler = handler;
+
+    index := 0;
+    while index < path.count {
+        path_part, next_index := get_next_path_part(path, index);
+
+        if !path_part {
+            return current_handler;
+        } else if path_part == "*" {
+            if !current_handler.optional {
+                current_handler.optional = New(HttpHandler);
+                current_handler.optional.part = "*";
+            }
+
+            current_handler = current_handler.optional;
+        } else {
+            static_handler := get_static_handler(*current_handler.children, path_part);
+            if !static_handler {
+                handler_entry: HttpHandler;
+                handler_entry.part = path_part;
+
+                static_handler = sorted_insert(*current_handler.children, handler_entry, (a: HttpHandler, b: HttpHandler) -> int {
+                    return string_compare(a.part, b.part);
+                });
+            }
+
+            current_handler = static_handler;
+        }
+
+        index = next_index;
+    }
+
+    return current_handler;
+}
+
+get_static_handler :: (handlers: *[..] HttpHandler, part: string) -> *HttpHandler {
+    lower_bound := 0;
+    upper_bound := handlers.count - 1;
+
+    while lower_bound <= upper_bound {
+        check_index := (lower_bound + upper_bound) / 2;
+
+        diff := string_compare(handlers.*[check_index].part, part);
+        if diff < 0 {
+            lower_bound = check_index + 1;
+        } else if diff > 0 {
+            upper_bound = check_index - 1;
+        } else {
+            lower_bound = check_index;
+            upper_bound = check_index;
+            return *handlers.*[check_index];
+        }
+    }
+
+    return null;
+}
+
+// get_optional_count :: (path: string) -> int {
+//     if path.count == 0 {
+//         return 0;
+//     }
+
+//     if path[0] != #char "/" {
+//         return 0;
+//     }
+
+//     count := 0;
+//     start := 0;
+//     for i: 0..path.count - 1 {
+//         if path[i] == #char "*" {
+            
+//         }
+//     }
+// }
+
+get_next_path_part :: (path: string, index: int) -> string, int {
+    while index < path.count && is_slash(path, index) {
+        index += 1;
+    }
+
+    count := 0;
+    while index + count < path.count && !is_slash(path, index + count) {
+        count += 1;
+    }
+
+    part: string;
+    part.data = path.data + index;
+    part.count = count;
+
+    // get rid of the trailing slashes for the new index
+    while index + count < path.count && is_slash(path, index + count) {
+        count += 1;
+    }
+
+    return part, index + count;
+}
 
 get_thread_context :: (server: *HttpServer) -> Context #c_call {
     push_context global_http_context {
@@ -296,20 +479,24 @@ memory_free_callback :: (cls: *void) #c_call {
     }
 }
 
-normalize_url :: (url: string) -> string {
-    normalized := url;
-    while normalized[normalized.count - 1] == #char "/" {
-        normalized.count -= 1;
-    }
+// normalize_url :: (url: string) -> string {
+//     if !url {
+//         return url;
+//     }
 
-    // theres a lot of other stuff that should be done, like changing forward
-    // slash to backslash or whatever
-    // but right now I'm not willing to allocate strings
-    // if I want to do this more intensely in the future I should just change
-    // the server to have a fixed array of bytes as keys
+//     normalized := url;
+//     while normalized[normalized.count - 1] == #char "/" {
+//         normalized.count -= 1;
+//     }
 
-    return normalized;
-}
+//     // theres a lot of other stuff that should be done, like changing forward
+//     // slash to backslash or whatever
+//     // but right now I'm not willing to allocate strings
+//     // if I want to do this more intensely in the future I should just change
+//     // the server to have a fixed array of bytes as keys
+
+//     return normalized;
+// }
 
 get_http_method :: (method: string) -> HttpMethod {
     if method == {
@@ -342,7 +529,7 @@ server_respond :: (cls: *void, connection: *MHD_Connection, url: *u8, method: *u
     thread_context := get_thread_context(server);
 
     push_context thread_context {
-        url_string := normalize_url(to_string(url));
+        url_string := to_string(url);
         method_string := to_string(method);
         http_method := get_http_method(method_string);
 
@@ -359,12 +546,16 @@ server_respond :: (cls: *void, connection: *MHD_Connection, url: *u8, method: *u
             if !http_request {
                 return .MHD_NO;
             }
+
+            // my assumption is that this will stay alive until the end of the request
+            content_type := MHD_lookup_connection_value(connection, .HEADER_KIND, MHD_HTTP_HEADER_CONTENT_TYPE);
+            http_request.content_type = to_string(content_type);
             
             http_request.server = server;
         }
 
         // if it's a post method we have to propagate the form data
-        if http_method == .Post {
+        if http_method == .Post && (http_request.content_type == MHD_HTTP_POST_ENCODING_FORM_URLENCODED || http_request.content_type == MHD_HTTP_POST_ENCODING_MULTIPART_FORMDATA) {
             if !http_request.post_processor {
                 http_request.post_processor = MHD_create_post_processor(connection, 1024, iterate_post, cast(*void) http_request);
                 if !http_request.post_processor {
@@ -395,36 +586,45 @@ server_respond :: (cls: *void, connection: *MHD_Connection, url: *u8, method: *u
         }
 
         // TODO need to remove all duplicate slashes and trailing slashes, and maybe store each / part as its own thing so I can match wildcards
-
-        handler := table_find_pointer(*server.static_handlers[cast(int) http_method], url_string);
-        if !handler {
-            handler = table_find_pointer(*server.optional_handlers[cast(int) http_method], url_string);
+        // first try to get the full path of the correct method
+        handler: RequestHandler;
+        path_handler := get_handler(*server.handlers[cast(int) http_method], url_string);
+        if path_handler {
+            handler = path_handler.callback;
         }
+        // otherwise try to get the fallback path of the correct method
         if !handler {
             handler = server.fallback_handlers[cast(int) http_method];
         }
+        // if it's a head request, repeat this using the get method
         if !handler && http_method == .Head {
-            // libmicrohttpd automatically handles removing the body so we'll fallback to get requests without any extra data
-            handler = table_find_pointer(*server.static_handlers[cast(int) HttpMethod.Get], url_string);
-            if !handler {
-                handler = table_find_pointer(*server.optional_handlers[cast(int) HttpMethod.Get], url_string);
+            path_handler := get_handler(*server.handlers[cast(int) HttpMethod.Get], url_string);
+            if path_handler {
+                handler = path_handler.callback;
             }
             if !handler {
                 handler = server.fallback_handlers[cast(int) HttpMethod.Get];
             }
         }
         if !handler {
-            handler = table_find_pointer(*server.static_handlers[cast(int) HttpMethod.Fallback], url_string);
+            // otherwise try to get the full path of the fallback method
+            path_handler := get_handler(*server.handlers[cast(int) HttpMethod.Fallback], url_string);
+            if path_handler {
+                handler = path_handler.callback;
+            }
+            // otherwise try to get the fallback path of the fallback method
+            if !handler {
+                handler = server.fallback_handlers[cast(int) HttpMethod.Fallback];
+            }
         }
-        if !handler {
-            handler = table_find_pointer(*server.static_handlers[cast(int) HttpMethod.Fallback], "*");
-        }
+        
+        // otherwise return not found
         if !handler {
             print("No valid fallback found. Begrudgingly returning 404.\n");
-            handler = *default_not_found_handler;
+            handler = default_not_found_handler;
         }
 
-        http_result := handler.*(http_request, *http_response);
+        http_result := handler(http_request, *http_response);
 
         reset_temporary_storage();
 
@@ -531,6 +731,63 @@ get_unix_time :: () -> u64 #c_call {
     }
 }
 
+is_slash :: inline (path: string, index: int) -> bool {
+    return path[index] == #char "/" || path[index] == #char "\\";
+}
+
+lower_char :: inline (char: u8) -> u8 {
+    if char >= #char "A" && char <= #char "Z"
+        return char + #char "a" - #char "A";
+
+    return char;
+}
+
+string_compare :: inline (a: string, b: string) -> int {
+    min_count := min(a.count, b.count);
+
+    diff: int;
+    count: int;
+    while diff == 0 && count < min_count {
+        diff = cast(int) lower_char(a[count]) - cast(int) lower_char(b[count]);
+        count += 1;
+    }
+
+    if diff == 0 {
+        if count < a.count {
+            return 1;
+        }
+
+        if count < b.count {
+            return -1;
+        }
+    }
+
+    return diff;
+}
+
+sorted_insert :: (array: *[..] $T, entry: T, $compare: (T, T) -> $R) -> *T {
+    lower_bound := 0;
+    upper_bound := array.count - 1;
+    while lower_bound < upper_bound - 1 {
+        check_index := (lower_bound + upper_bound) / 2;
+
+        diff := compare(array.*[check_index], entry);
+        if diff < 0 {
+            lower_bound = check_index;
+        } else if diff > 0 {
+            upper_bound = check_index;
+        } else {
+            lower_bound = check_index;
+            upper_bound = check_index;
+        }
+    }
+
+    upper_bound = max(upper_bound, 0);
+
+    array_insert_at(array, entry, upper_bound);
+    return *array.*[upper_bound];
+}
+
 global_http_context: Context;
 
 default_not_found_handler := (request: *HttpRequest, response: *HttpResponse) -> HttpResult {
@@ -547,3 +804,4 @@ http_method_count :: cast(u16) HttpMethod.Fallback + 1;
 #import "System";
 #import "Thread";
 #import "Hash_Table";
+#import "String";
