@@ -6,7 +6,8 @@ HttpServer :: struct {
     daemon: *MHD_Daemon;
     handlers: [http_method_count] HttpHandler;
     // optional_handlers: [http_method_count] [..] HttpHandlerWithOptions;
-    fallback_handlers: [http_method_count] RequestHandler;
+    fallback_handlers: [http_method_count] InternalRequestHandler;
+    // fallback_handlers_with_options: [http_method_count] RequestHandlerWithOptions;
     extra_headers: [] [2] *u8;
     // once this is flipped to true we'll no longer lock the mutex since the table will never again change
     threads_propagated: bool;
@@ -15,14 +16,16 @@ HttpServer :: struct {
     allocator: Allocator;
 }
 
+// RequestHandlerWithOptions :: struct {
+//     callback: *void;
+//     callback_type: Type;
+// }
+
 HttpHandler :: struct {
     part: string;
     children: [..] HttpHandler;
     optional: *HttpHandler;
-    union {
-        callback: RequestHandler;
-        callback_with_options: RequestHandlerWithOptions;
-    }
+    callback: InternalRequestHandler;
 }
 
 // HttpHandlerWithOptions :: struct {
@@ -77,8 +80,9 @@ HttpMemoryMode :: enum u16 {
     Copy;
 }
 
-RequestHandler :: #type (request: *HttpRequest, response: *HttpResponse) -> HttpResult;
-RequestHandlerWithOptions :: #type (request: *HttpRequest, response: *HttpResponse, path_fields: ..string) -> HttpResult;
+// RequestHandler :: #type (request: *HttpRequest, response: *HttpResponse) -> HttpResult;
+InternalRequestHandler :: #type (request: *HttpRequest, response: *HttpResponse, optionals: [] string) -> HttpResult;
+// RequestHandlerWithOptions :: #type (request: *HttpRequest, response: *HttpResponse, path_fields: ..string) -> HttpResult;
 
 create_server :: (port: u16, timeout_seconds: int = 60, thread_count: int = core_count) -> *HttpServer {
     server := New(HttpServer);
@@ -144,29 +148,106 @@ server_stop :: (server: *HttpServer) {
     server.threads_propagated = false;
 }
 
-handle :: (server: *HttpServer, method: HttpMethod, $path: string, $handler: RequestHandler) {
+// this method accepts your handler, and it bakes it inside a compile time method that automatically unwraps an array
+handle :: (server: *HttpServer, method: HttpMethod, $path: string, $handler: $T) {
     #run assert(starts_with(path, "/") || starts_with(path, "*"), "Your handler path must start with either \"/\" or \"*\".");
-    // #run assert(find_index_from_left(path, #char "*") <= 0, "You cannot provide optional paths in your static request handler.");
+    #run assert(!starts_with(path, "*") || path.count == 1, "If your handler path starts with \"*\" it cannot contain anything else.");
+
+    has_optional_arguments :: #run (cast(*Type_Info_Procedure) type_info(T)).argument_types.count > 2;
+
+    #if has_optional_arguments {
+        // #run assert((cast(*Type_Info_Procedure) type_info(T)).argument_types.count - 2 == get_optional_count(path), "If you have optional arguments you must have as many as optional path parts.");
+        #run assert((cast(*Type_Info_Procedure) type_info(T)).argument_types.count - 2 <= get_optional_count(path), "You cannot have more optional arguments than optional path parts.");
+        #run assert(() -> bool {
+            procedure_info := cast(*Type_Info_Procedure) type_info(T);
+            for i: 2..procedure_info.argument_types.count - 1 {
+                if procedure_info.argument_types[i].type != .STRING {
+                    return false;
+                }
+            }
+
+            return true;
+        }(), "You cannot have optional arguments that are non-strings.");
+
+        #insert #run () -> string {
+            procedure_info := cast(*Type_Info_Procedure) type_info(T);
+            handler_optional_count := procedure_info.argument_types.count - 2;
+
+            // we're guaranteed to pass in the correct number of optionals because the path is compile time and calling this is handled internally
+            builder: String_Builder;
+            append(*builder, "internal_handler :: (request: *HttpRequest, response: *HttpResponse, optionals: [] string) -> HttpResult {\n");
+            for i: 0..handler_optional_count - 1 {
+                append(*builder, tprint("optional% := optionals[%];\n", i, i));
+            }
+
+            append(*builder, "return inline handler(request, response, ");
+            for i: 0..handler_optional_count - 1 {
+                append(*builder, tprint("optional%", i, i));
+                if i < handler_optional_count - 1 {
+                    append(*builder, ", ");
+                }
+                append(*builder, ");\n");
+            }
+            append(*builder, "}\n");
+
+            return builder_to_string(*builder);
+        }();
+    } else {
+        internal_handler :: (request: *HttpRequest, response: *HttpResponse, optionals: [] string) -> HttpResult {
+            return inline handler(request, response);
+        }
+    }
 
     #if path == "*" {
-        server.fallback_handlers[cast(int) method] = handler;
+        assert(!server.fallback_handlers[cast(int) method], "You cannot override an existing handler callback.");
+        server.fallback_handlers[cast(int) method] = internal_handler;
     } else {
         final_handler := add_handler(*server.handlers[cast(int) method], path);
         assert(!final_handler.callback, "You cannot override an existing handler callback.");
-        final_handler.callback = handler;
+        final_handler.callback = internal_handler;
     }
 }
 
-handle :: (server: *HttpServer, method: HttpMethod, $path: string, $handler: RequestHandlerWithOptions) {
-    #run assert(starts_with(path, "/"), "Your handler path must start with either \"/\" or \"*\".");
-    #run assert(find_index_from_left(path, #char "*") > 0, "You cannot provide static paths in your optional request handler.");
+// handle :: (server: *HttpServer, method: HttpMethod, $path: string, $handler: $T) #modify {
+//     return (cast(*Type_Info_Procedure) type_info(T)).argument_types.count > 2;
+// } {
+//     #run assert(starts_with(path, "/") || starts_with(path, "*"), "Your handler path must start with either \"/\" or \"*\".");
+//     #run assert((cast(*Type_Info_Procedure) type_info(T)).argument_types.count - 2 == get_optional_count(path), "You must have the same number of optional arguments as path options.");
+//     #run assert(() -> bool {
+//         procedure_info := cast(*Type_Info_Procedure) type_info(T);
+//         for i: 2..procedure_info.argument_types.count - 1 {
+//             if procedure_info.argument_types[i].type != .STRING {
+//                 return false;
+//             }
+//         }
 
-    // TODO match the number of optionals to the number of vargs
+//         return true;
+//     }(), "You cannot have optional arguments that are non-strings.");
 
-    final_handler := add_handler(*server.handlers[cast(int) method], path);
-    assert(!final_handler.callback_with_options, "You cannot override an existing handler callback.");
-    final_handler.callback_with_options = handler;
-}
+//     #if path == "*" {
+//         assert(!server.fallback_handlers[cast(int) method], "You cannot have both optional handlers and static handlers.");
+//         assert(!server.fallback_handlers_with_options[cast(int) method], "You cannot override an existing handler callback.");
+//         server.fallback_handlers_with_options[cast(int) method] = .{cast(*void) handler, T};
+//     } else {
+//         final_handler := add_handler(*server.handlers[cast(int) method], path);
+//         assert(!final_handler.callback, "You cannot have both optional handlers and static handlers.");
+//         assert(!final_handler.callback_with_options, "You cannot override an existing handler callback.");
+//         final_handler.callback_with_options = .{cast(*void) handler, T};
+//     }
+// }
+
+// handle :: (server: *HttpServer, method: HttpMethod, $path: string, $handler: $T) {
+//     #run assert(starts_with(path, "/"), "Your handler path must start with either \"/\" or \"*\".");
+//     #run assert(find_index_from_left(path, #char "*") > 0, "You cannot provide static paths in your optional request handler.");
+
+//     #run print("%\n", type_info(T));
+
+//     // TODO match the number of optionals to the number of vargs
+
+//     final_handler := add_handler(*server.handlers[cast(int) method], path);
+//     assert(!final_handler.callback_with_options, "You cannot override an existing handler callback.");
+//     final_handler.callback_with_options = handler;
+// }
 
 reply :: (response: *HttpResponse, status: u16, extra_headers: [] [2] *u8, body: string, memory_mode: HttpMemoryMode) -> HttpResult {
     assert(body.count == 0 || body[body.count - 1] == #char "\0", "Your body must either be null or must end with a null character.");
@@ -260,7 +341,7 @@ destroy_handler :: (handler: HttpHandler) {
     array_free(handler.children);
 }
 
-get_handler :: (handler: *HttpHandler, path: string) -> *HttpHandler {
+get_handler :: (handler: *HttpHandler, path: string, optional_parts: *[..] string) -> *HttpHandler {
     if !path {
         return null;
     }
@@ -272,6 +353,7 @@ get_handler :: (handler: *HttpHandler, path: string) -> *HttpHandler {
     }
 
     next_handler: *HttpHandler = handler;
+    optional_parts.count = 0;
 
     index := 0;
     while index < path.count && next_handler {
@@ -281,8 +363,11 @@ get_handler :: (handler: *HttpHandler, path: string) -> *HttpHandler {
             static_handler := get_static_handler(*next_handler.children, path_part);
             if static_handler {
                 next_handler = static_handler;
-            } else {
+            } else if next_handler.optional {
                 next_handler = next_handler.optional;
+                array_add(optional_parts, path_part);
+            } else {
+                next_handler = null;
             }
         }
 
@@ -314,6 +399,12 @@ add_handler :: (handler: *HttpHandler, $path: string) -> *HttpHandler {
             current_handler = current_handler.optional;
         } else {
             static_handler := get_static_handler(*current_handler.children, path_part);
+            print("looking for static handler for %\n", path_part);
+            print("looking in children\n");
+            for child: current_handler.children {
+                print("\t%\n", child);
+            }
+            print("found %\n", static_handler);
             if !static_handler {
                 handler_entry: HttpHandler;
                 handler_entry.part = path_part;
@@ -354,23 +445,26 @@ get_static_handler :: (handlers: *[..] HttpHandler, part: string) -> *HttpHandle
     return null;
 }
 
-// get_optional_count :: (path: string) -> int {
-//     if path.count == 0 {
-//         return 0;
-//     }
+get_optional_count :: (path: string) -> int {
+    if path.count == 0 {
+        return 0;
+    }
 
-//     if path[0] != #char "/" {
-//         return 0;
-//     }
+    count := 0;
 
-//     count := 0;
-//     start := 0;
-//     for i: 0..path.count - 1 {
-//         if path[i] == #char "*" {
-            
-//         }
-//     }
-// }
+    index := 0;
+    while index < path.count {
+        path_part, next_index := get_next_path_part(path, index);
+
+        if path_part == "*" {
+            count += 1;
+        }
+
+        index = next_index;
+    }
+
+    return count;
+}
 
 get_next_path_part :: (path: string, index: int) -> string, int {
     while index < path.count && is_slash(path, index) {
@@ -587,44 +681,64 @@ server_respond :: (cls: *void, connection: *MHD_Connection, url: *u8, method: *u
 
         // TODO need to remove all duplicate slashes and trailing slashes, and maybe store each / part as its own thing so I can match wildcards
         // first try to get the full path of the correct method
-        handler: RequestHandler;
-        path_handler := get_handler(*server.handlers[cast(int) http_method], url_string);
+        handler: InternalRequestHandler;
+
+        optional_parts: [..] string;
+        defer array_free(optional_parts);
+
+        path_handler := get_handler(*server.handlers[cast(int) http_method], url_string, *optional_parts);
         if path_handler {
             handler = path_handler.callback;
         }
         // otherwise try to get the fallback path of the correct method
         if !handler {
             handler = server.fallback_handlers[cast(int) http_method];
+            if handler {
+                // maybe I should curate the path myself, lowercase and normalize slashes and all that in fallbacks
+                // probably only if the method indicates they have optionals
+                optional_parts.count = 0;
+                array_add(*optional_parts, url_string);
+            }
         }
         // if it's a head request, repeat this using the get method
         if !handler && http_method == .Head {
-            path_handler := get_handler(*server.handlers[cast(int) HttpMethod.Get], url_string);
+            path_handler := get_handler(*server.handlers[cast(int) HttpMethod.Get], url_string, *optional_parts);
             if path_handler {
                 handler = path_handler.callback;
             }
             if !handler {
                 handler = server.fallback_handlers[cast(int) HttpMethod.Get];
+                if handler {
+                    optional_parts.count = 0;
+                    array_add(*optional_parts, url_string);
+                }
             }
         }
         if !handler {
             // otherwise try to get the full path of the fallback method
-            path_handler := get_handler(*server.handlers[cast(int) HttpMethod.Fallback], url_string);
+            path_handler := get_handler(*server.handlers[cast(int) HttpMethod.Fallback], url_string, *optional_parts);
             if path_handler {
                 handler = path_handler.callback;
             }
             // otherwise try to get the fallback path of the fallback method
             if !handler {
                 handler = server.fallback_handlers[cast(int) HttpMethod.Fallback];
+                if handler {
+                    optional_parts.count = 0;
+                    array_add(*optional_parts, url_string);
+                }
             }
         }
-        
+
         // otherwise return not found
         if !handler {
             print("No valid fallback found. Begrudgingly returning 404.\n");
             handler = default_not_found_handler;
+            optional_parts.count = 0;
+            array_add(*optional_parts, url_string);
         }
 
-        http_result := handler(http_request, *http_response);
+        http_result := handler(http_request, *http_response, optional_parts);
 
         reset_temporary_storage();
 
@@ -765,6 +879,15 @@ string_compare :: inline (a: string, b: string) -> int {
     return diff;
 }
 
+// #run () {
+//     sorted: [..] string;
+//     sorted_insert(*sorted, "frontpage", string_compare);
+//     sorted_insert(*sorted, "asd", string_compare);
+//     sorted_insert(*sorted, "asd", string_compare);
+//     sorted_insert(*sorted, "frontpage", string_compare);
+//     print("generated %\n", sorted);
+// }();
+
 sorted_insert :: (array: *[..] $T, entry: T, $compare: (T, T) -> $R) -> *T {
     lower_bound := 0;
     upper_bound := array.count - 1;
@@ -782,15 +905,33 @@ sorted_insert :: (array: *[..] $T, entry: T, $compare: (T, T) -> $R) -> *T {
         }
     }
 
-    upper_bound = max(upper_bound, 0);
+    insert := max(lower_bound, upper_bound);
+    if array.count > 0 {
+        if compare(array.*[insert], entry) < 0 {
+            insert += 1;
+        }
+    }
 
-    array_insert_at(array, entry, upper_bound);
-    return *array.*[upper_bound];
+    array_insert_at(array, entry, insert);
+
+    #if true {
+        for i: 0..array.count - 2 {
+            if compare(array.*[i], array.*[i + 1]) > 0 {
+                print("Sorted insert didn't work. %\n", entry);
+                for entry: array.* {
+                    print("\t%\n", entry);
+                }
+                assert(false);
+            }
+        }
+    }
+
+    return *array.*[insert];
 }
 
 global_http_context: Context;
 
-default_not_found_handler := (request: *HttpRequest, response: *HttpResponse) -> HttpResult {
+default_not_found_handler := (request: *HttpRequest, response: *HttpResponse, optionals: [] string) -> HttpResult {
     return reply(response, 404, .[], null);
 }
 
