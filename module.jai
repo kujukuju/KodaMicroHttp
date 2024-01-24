@@ -11,9 +11,9 @@ HttpServer :: struct {
     extra_headers: [] [2] *u8;
     // once this is flipped to true we'll no longer lock the mutex since the table will never again change
     threads_propagated: bool;
-    thread_contexts_mutex: Mutex;
-    thread_contexts: Table(u64, Context);
-    allocator: Allocator;
+    // thread_contexts_mutex: Mutex;
+    // thread_contexts: Table(u64, Context);
+    // allocator: Allocator;
 }
 
 // RequestHandlerWithOptions :: struct {
@@ -45,6 +45,7 @@ HttpRequest :: struct {
     server: *HttpServer;
     form_data: [..] HttpFormEntry;
     post_processor: *MHD_PostProcessor;
+    connection: *MHD_Connection;
     content_type: string;
     error: bool;
 }
@@ -89,9 +90,14 @@ create_server :: (port: u16, timeout_seconds: int = 60, thread_count: int = core
     server.port = port;
     server.timeout_seconds = timeout_seconds;
     server.thread_count = thread_count;
-    server.allocator = context.allocator;
+    // server.allocator = context.allocator;
 
-    init(*server.thread_contexts_mutex);
+    // init(*server.thread_contexts_mutex);
+
+    if !static_buffer_mutex_init {
+        static_buffer_mutex_init = true;
+        init(*static_buffer_mutex);
+    }
 
     return server;
 }
@@ -100,7 +106,7 @@ destroy_server :: (server: *HttpServer) {
     for handler: server.handlers {
         destroy_handler(handler);
     }
-    destroy(*server.thread_contexts_mutex);
+    // destroy(*server.thread_contexts_mutex);
     // not sure if the daemon has to be freed, I don't think so
     free(server);
 }
@@ -110,28 +116,28 @@ server_listen :: (server: *HttpServer) {
         return;
     }
 
-    print("Listening on port %...\n", server.port);
-
     semaphore: Semaphore;
     init(*semaphore);
     wait_for(*semaphore);
 }
 
 server_listen_async :: (server: *HttpServer) -> bool {
-    init(*server.thread_contexts, server.thread_count);
+    // init(*server.thread_contexts, server.thread_count);
 
     server.daemon = MHD_start_daemon(
-        cast(u32) (MHD_FLAG.MHD_USE_INTERNAL_POLLING_THREAD | .USE_AUTO),
+        cast(u32) MHD_FLAG.MHD_USE_THREAD_PER_CONNECTION,
         server.port,
         null,
         null,
         server_respond,
         cast(*void) server,
-        MHD_OPTION.MHD_OPTION_NOTIFY_COMPLETED, server_completed, null,
+        MHD_OPTION.MHD_OPTION_NOTIFY_COMPLETED, server_completed, cast(*void) server,
         MHD_OPTION.MHD_OPTION_CONNECTION_MEMORY_LIMIT, cast(u64) (256 * 1024),
-        MHD_OPTION.MHD_OPTION_THREAD_POOL_SIZE, server.thread_count,
+        // MHD_OPTION.MHD_OPTION_THREAD_POOL_SIZE, 1,
         MHD_OPTION.MHD_OPTION_CONNECTION_TIMEOUT, server.timeout_seconds,
         MHD_OPTION.MHD_OPTION_END);
+
+    print("Listening on port %...\n", server.port);
 
     return server.daemon != null;
 }
@@ -141,10 +147,10 @@ server_stop :: (server: *HttpServer) {
 
     MHD_stop_daemon(server.daemon);
 
-    for thread_context, thread_id: server.thread_contexts {
-        free_thread_context(server, thread_context);
-    }
-    deinit(*server.thread_contexts);
+    // for thread_context, thread_id: server.thread_contexts {
+    //     free_thread_context(server, thread_context);
+    // }
+    // deinit(*server.thread_contexts);
     server.threads_propagated = false;
 }
 
@@ -182,12 +188,12 @@ handle :: (server: *HttpServer, method: HttpMethod, $path: string, $handler: $T)
 
             append(*builder, "return inline handler(request, response, ");
             for i: 0..handler_optional_count - 1 {
-                append(*builder, tprint("optional%", i, i));
+                append(*builder, tprint("optional%", i));
                 if i < handler_optional_count - 1 {
                     append(*builder, ", ");
                 }
-                append(*builder, ");\n");
             }
+            append(*builder, ");\n");
             append(*builder, "}\n");
 
             return builder_to_string(*builder);
@@ -249,15 +255,35 @@ handle :: (server: *HttpServer, method: HttpMethod, $path: string, $handler: $T)
 //     final_handler.callback_with_options = handler;
 // }
 
-reply :: (response: *HttpResponse, status: u16, extra_headers: [] [2] *u8, body: string, memory_mode: HttpMemoryMode) -> HttpResult {
-    assert(body.count == 0 || body[body.count - 1] == #char "\0", "Your body must either be null or must end with a null character.");
+reply :: (response: *HttpResponse, status: u16) -> HttpResult {
+    return reply(response, status, .[], null);
+}
 
-    body_count: int;
-    if body.count > 0 {
-        body_count = body.count - 1;
+reply :: (response: *HttpResponse, status: u16, extra_headers: [] [2] *u8, body: string, memory_mode: HttpMemoryMode) -> HttpResult {
+    // assert(body.count == 0 || body[body.count - 1] == #char "\0", "Your body must either be null or must end with a null character.");
+    if body.count > 0 && body[body.count - 1] != #char "\0" {
+        print("Warning: Your response body must either be null or end with a null character. A new string will be allocated to fix this, but this isn't performant.\n");
+        // print_stack_trace();
+
+        if #complete memory_mode == {
+            // do nothing with the memory when done
+            case .Static;
+                return inline reply(response, status, extra_headers, to_c_string(body), .Allocated);
+
+            // free the memory when done
+            case .Allocated;
+                c_string := to_c_string(body);
+                free(body);
+                return inline reply(response, status, extra_headers, c_string, .Allocated);
+
+            // copy and manage the memory entirely
+            case .Copy;
+                return inline reply(response, status, extra_headers, to_c_string(body), .Allocated);
+
+        }
     }
 
-    return inline reply(response, status, extra_headers, body.data, body_count, memory_mode);
+    return inline reply(response, status, extra_headers, body.data, max(0, body.count - 1), memory_mode);
 }
 
 reply :: (response: *HttpResponse, status: u16, extra_headers: [] [2] *u8, $body: *u8) -> HttpResult {
@@ -268,6 +294,8 @@ reply :: (response: *HttpResponse, status: u16, extra_headers: [] [2] *u8, $body
 
         return c_style_strlen(body);
     }(body);
+
+    // why cant I use $body: string? and not require \0
 
     return inline reply(response, status, extra_headers, body, body_count, .Static);
 }
@@ -324,7 +352,93 @@ get_form_data :: (request: *HttpRequest, name: string) -> *string {
     return null;
 }
 
+get_connection_ip :: (request: *HttpRequest) -> string {
+    Socket :: #import "Socket";
+    sockaddr :: Socket.sockaddr;
+    sockaddr_in :: Socket.sockaddr_in;
+    inet_ntoa :: Socket.inet_ntoa;
+
+    lock(*static_buffer_mutex);
+    defer unlock(*static_buffer_mutex);
+    
+    connection_info := MHD_get_connection_info(request.connection, .CLIENT_ADDRESS);
+    client_address: *sockaddr = connection_info.client_addr;
+    client_address_in := cast(*sockaddr_in) client_address;
+
+    address_string := copy_string(to_string(inet_ntoa(client_address_in.sin_addr)));
+
+    return address_string;
+}
+
+get_content_type :: (path: string) -> *u8 {
+    CONTENT_TYPES :: ([2] *u8).[
+        .["html", "text/html; charset=utf-8"],
+        .["htm", "text/html; charset=utf-8"],
+        .["css", "text/css; charset=utf-8"],
+        .["js", "text/javascript; charset=utf-8"],
+        .["gif", "image/gif"],
+        .["png", "image/png"],
+        .["jpg", "image/jpeg"],
+        .["jpeg", "image/jpeg"],
+        .["woff", "font/woff"],
+        .["ttf", "font/ttf"],
+        .["svg", "image/svg+xml"],
+        .["txt", "text/plain; charset=utf-8"],
+        .["avi", "video/x-msvideo"],
+        .["csv", "text/csv"],
+        .["doc", "application/msword"],
+        .["exe", "application/octet-stream"],
+        .["gz", "application/gzip"],
+        .["ico", "image/x-icon"],
+        .["json", "application/json"],
+        .["mov", "video/quicktime"],
+        .["mp3", "audio/mpeg"],
+        .["mp4", "video/mp4"],
+        .["mpeg", "video/mpeg"],
+        .["pdf", "application/pdf"],
+        .["shtml", "text/html; charset=utf-8"],
+        .["tgz", "application/tar-gz"],
+        .["wav", "audio/wav"],
+        .["webp", "image/webp"],
+        .["zip", "application/zip"],
+        .["3gp", "video/3gpp"],
+        .["wasm", "application/wasm"],
+    ];
+
+    extension_string: string;
+
+    period_index := find_index_from_right(path, ".");
+    if period_index == -1 {
+        extension_string = path;
+    } else {
+        extension_string.data = path.data + period_index + 1;
+        extension_string.count = path.count - period_index - 1;
+    }
+
+    for content_type: CONTENT_TYPES {
+        if string_compare(to_string(content_type[0]), extension_string) == 0 {
+            return content_type[1];
+        }
+    }
+
+    return "";
+}
+
 #scope_file
+
+print_stack_trace :: () {
+    node := context.stack_trace;
+    while node {
+        // There are two different line numbers available.
+        // node.info.location has a line number, but this is the location of
+        // the start of the procedure. That may be useful in some cases, but often
+        // what we really want is the line number of the procedure call, which is
+        // stored in node.line_number. That's what we print in this case.
+        
+        if node.info print("'%' at %:% ; call depth %, hash 0x%\n", node.info.name, node.info.location.fully_pathed_filename, node.line_number, node.call_depth, formatInt(node.hash, base=16));
+        node = node.next;
+    }
+}
 
 destroy_handler :: (handler: HttpHandler) {
     // we don't free the part string because it's just a segment of a compile time string
@@ -399,12 +513,6 @@ add_handler :: (handler: *HttpHandler, $path: string) -> *HttpHandler {
             current_handler = current_handler.optional;
         } else {
             static_handler := get_static_handler(*current_handler.children, path_part);
-            print("looking for static handler for %\n", path_part);
-            print("looking in children\n");
-            for child: current_handler.children {
-                print("\t%\n", child);
-            }
-            print("found %\n", static_handler);
             if !static_handler {
                 handler_entry: HttpHandler;
                 handler_entry.part = path_part;
@@ -488,58 +596,117 @@ get_next_path_part :: (path: string, index: int) -> string, int {
     return part, index + count;
 }
 
-get_thread_context :: (server: *HttpServer) -> Context #c_call {
-    push_context global_http_context {
-        context.allocator = server.allocator;
+// get_thread_context :: (server: *HttpServer) -> Context #c_call {
+//     push_context global_http_context {
+//         // context.allocator = server.allocator;
 
-        thread_id := get_thread_id();
+//         thread_id := get_thread_id();
+//         print("Getting thread %\n", thread_id);
 
-        threads_propagated := server.threads_propagated;
-        if !threads_propagated {
-            lock(*server.thread_contexts_mutex);
+//         print("Server %\n", server);
+//         // print("Propagated %\n", *server.threads_propagated);
+//         // print("Propagated %\n", server.threads_propagated);
+//         threads_propagated := server.threads_propagated;
+//         if !threads_propagated {
+//             lock(*server.thread_contexts_mutex);
+//         }
+
+//         print("Table pointer address %\n", *server.thread_contexts);
+
+//         thread_context_pointer := table_find_pointer(*server.thread_contexts, thread_id);
+//         if !thread_context_pointer {
+//             thread_context_pointer = table_add(*server.thread_contexts, thread_id, create_thread_context(server, thread_id));
+//         }
+
+//         if !threads_propagated {
+//             threads_propagated = server.thread_contexts.count >= server.thread_count;
+//             unlock(*server.thread_contexts_mutex);
+//         }
+
+//         return thread_context_pointer.*;
+//     }
+// }
+
+// create_thread_context :: (server: *HttpServer, thread_id: u64) -> Context {
+//     truncated_thread_id: u32;
+//     truncated_thread_id = (cast(u32) (thread_id & 0xffffffff)) ^ (cast(u32) ((thread_id >> 32) & 0xffffffff));
+
+//     temporary_storage_size := 16384;
+
+//     thread_context: Context;
+//     thread_context.thread_index = truncated_thread_id;
+//     thread_context.base.context_info = type_info(Context);
+//     // thread_context.allocator = server.allocator;
+//     #if OS == .WINDOWS {
+//         thread_context.allocator.proc(.THREAD_START, 0, 0, null, thread_context.allocator.data);
+//     }
+//     thread_context.temporary_storage = New(Temporary_Storage);
+//     set_initial_data(thread_context.temporary_storage, temporary_storage_size, alloc(temporary_storage_size));
+//     push_context thread_context {
+//         random_seed(get_unix_time());
+//     }
+
+//     return thread_context;
+// }
+
+// free_thread_context :: (server: *HttpServer, thread_context: Context) {
+//     push_context global_http_context {
+//         // context.allocator = server.allocator;
+
+//         print("Freeing thread context. It should probably never do this.\n");
+
+//         #if OS == .WINDOWS {
+//             thread_context.allocator.proc(.THREAD_STOP, 0, 0, null, thread_context.allocator.data);
+//         }
+
+//         free(thread_context.temporary_storage.original_data);
+
+//         overflow := thread_context.temporary_storage.overflow_pages;
+//         while overflow {
+//             next := overflow.next;
+//             free(overflow);
+//             overflow = next;
+//         }
+
+//         free(thread_context.temporary_storage);
+//     }
+// }
+
+create_context :: () -> Context #c_call {
+    empty_context: Context;
+    push_context empty_context {
+        temporary_storage_size :: 16384;
+
+        thread_context: Context;
+        thread_context.thread_index = cast(u32) get_thread_id();
+        thread_context.base.context_info = type_info(Context);
+        thread_context.temporary_storage = New(Temporary_Storage);
+        set_initial_data(thread_context.temporary_storage, temporary_storage_size, alloc(temporary_storage_size));
+        thread_context.temporary_storage.current_page_bytes_occupied = 0;
+        thread_context.temporary_storage.total_bytes_occupied = 0;
+        thread_context.temporary_storage.high_water_mark = 0;
+
+        push_context thread_context {
+            random_seed(get_unix_time());
         }
 
-        thread_context_pointer := table_find_pointer(*server.thread_contexts, thread_id);
-        if !thread_context_pointer {
-            thread_context_pointer = table_add(*server.thread_contexts, thread_id, create_thread_context(server, thread_id));
-        }
-
-        if !threads_propagated {
-            threads_propagated = server.thread_contexts.count >= server.thread_count;
-            unlock(*server.thread_contexts_mutex);
-        }
-
-        return thread_context_pointer.*;
+        return thread_context;
     }
 }
 
-create_thread_context :: (server: *HttpServer, thread_id: u64) -> Context {
-    truncated_thread_id: u32;
-    truncated_thread_id = (cast(u32) (thread_id & 0xffffffff)) ^ (cast(u32) ((thread_id >> 32) & 0xffffffff));
-
-    temporary_storage_size := 16384;
-
-    thread_context: Context;
-    thread_context.thread_index = truncated_thread_id;
-    thread_context.base.context_info = type_info(Context);
-    thread_context.allocator = server.allocator;
-    thread_context.temporary_storage = New(Temporary_Storage);
-    set_initial_data(thread_context.temporary_storage, temporary_storage_size, alloc(temporary_storage_size));
-
-    return thread_context;
-}
-
-free_thread_context :: (server: *HttpServer, thread_context: Context) {
-    push_context global_http_context {
-        context.allocator = server.allocator;
-
+free_context :: (thread_context: Context) #c_call {
+    empty_context: Context;
+    push_context empty_context {
         free(thread_context.temporary_storage.original_data);
 
         overflow := thread_context.temporary_storage.overflow_pages;
         while overflow {
+            next := overflow.next;
             free(overflow);
-            overflow = overflow.next;
+            overflow = next;
         }
+
+        free(thread_context.temporary_storage);
     }
 }
 
@@ -566,9 +733,11 @@ get_thread_id :: () -> u64 {
 
 memory_free_callback :: (cls: *void) #c_call {
     server := cast(*HttpServer) cls;
-    thread_context := get_thread_context(server);
+    // thread_context := get_thread_context(server);
 
-    push_context thread_context {
+    // doesn't need temporary storage
+    new_context: Context;
+    push_context new_context {
         free(cls);
     }
 }
@@ -620,9 +789,13 @@ get_http_method :: (method: string) -> HttpMethod {
 server_respond :: (cls: *void, connection: *MHD_Connection, url: *u8, method: *u8, version: *u8, upload_data: *u8, upload_data_size: *u64, req_cls: **void) -> MHD_Result #c_call {
     request_time := get_unix_time();
     server := cast(*HttpServer) cls;
-    thread_context := get_thread_context(server);
+    // thread_context := get_thread_context(server);
+    // new_context: Context;
+    thread_context := create_context();
+    defer free_context(thread_context);
 
     push_context thread_context {
+
         url_string := to_string(url);
         method_string := to_string(method);
         http_method := get_http_method(method_string);
@@ -644,12 +817,12 @@ server_respond :: (cls: *void, connection: *MHD_Connection, url: *u8, method: *u
             // my assumption is that this will stay alive until the end of the request
             content_type := MHD_lookup_connection_value(connection, .HEADER_KIND, MHD_HTTP_HEADER_CONTENT_TYPE);
             http_request.content_type = to_string(content_type);
-            
             http_request.server = server;
+            http_request.connection = connection;
         }
 
         // if it's a post method we have to propagate the form data
-        if http_method == .Post && (http_request.content_type == MHD_HTTP_POST_ENCODING_FORM_URLENCODED || http_request.content_type == MHD_HTTP_POST_ENCODING_MULTIPART_FORMDATA) {
+        if http_method == .Post && (starts_with(http_request.content_type, MHD_HTTP_POST_ENCODING_FORM_URLENCODED) || starts_with(http_request.content_type, MHD_HTTP_POST_ENCODING_MULTIPART_FORMDATA)) {
             if !http_request.post_processor {
                 http_request.post_processor = MHD_create_post_processor(connection, 1024, iterate_post, cast(*void) http_request);
                 if !http_request.post_processor {
@@ -749,8 +922,9 @@ server_respond :: (cls: *void, connection: *MHD_Connection, url: *u8, method: *u
 iterate_post :: (cls: *void, kind: MHD_ValueKind, key: *u8, filename: *u8, content_type: *u8, transfer_encoding: *u8, data: *u8, off: u64, size: size_t) -> MHD_Result #c_call {
     http_request := cast(*HttpRequest) cls;
 
-    push_context global_http_context {
-        context.allocator = http_request.server.allocator;
+    new_context: Context;
+    push_context new_context {
+        // context.allocator = http_request.server.allocator;
 
         key_string := to_string(key);
 
@@ -791,8 +965,9 @@ iterate_post :: (cls: *void, kind: MHD_ValueKind, key: *u8, filename: *u8, conte
 server_completed :: (cls: *void, connection: *MHD_Connection, req_cls: **void, toe: MHD_RequestTerminationCode) #c_call {
     http_request := cast(*HttpRequest) req_cls.*;
 
-    push_context global_http_context {
-        context.allocator = http_request.server.allocator;
+    new_context: Context;
+    push_context new_context {
+        // context.allocator = http_request.server.allocator;
 
         if !http_request {
             return;
@@ -879,28 +1054,20 @@ string_compare :: inline (a: string, b: string) -> int {
     return diff;
 }
 
-// #run () {
-//     sorted: [..] string;
-//     sorted_insert(*sorted, "frontpage", string_compare);
-//     sorted_insert(*sorted, "asd", string_compare);
-//     sorted_insert(*sorted, "asd", string_compare);
-//     sorted_insert(*sorted, "frontpage", string_compare);
-//     print("generated %\n", sorted);
-// }();
-
 sorted_insert :: (array: *[..] $T, entry: T, $compare: (T, T) -> $R) -> *T {
+    // TODO I bet this is wrong somehow
     lower_bound := 0;
     upper_bound := array.count - 1;
-    while lower_bound < upper_bound - 1 {
+    while lower_bound <= upper_bound - 1 {
         check_index := (lower_bound + upper_bound) / 2;
 
         diff := compare(array.*[check_index], entry);
         if diff < 0 {
-            lower_bound = check_index;
+            lower_bound = check_index + 1;
         } else if diff > 0 {
             upper_bound = check_index;
         } else {
-            lower_bound = check_index;
+            lower_bound = check_index + 1;
             upper_bound = check_index;
         }
     }
@@ -929,7 +1096,10 @@ sorted_insert :: (array: *[..] $T, entry: T, $compare: (T, T) -> $R) -> *T {
     return *array.*[insert];
 }
 
-global_http_context: Context;
+static_buffer_mutex: Mutex;
+static_buffer_mutex_init: bool;
+
+// global_http_context: Context;
 
 default_not_found_handler := (request: *HttpRequest, response: *HttpResponse, optionals: [] string) -> HttpResult {
     return reply(response, 404, .[], null);
@@ -946,3 +1116,4 @@ http_method_count :: cast(u16) HttpMethod.Fallback + 1;
 #import "Thread";
 #import "Hash_Table";
 #import "String";
+#import "Random";
