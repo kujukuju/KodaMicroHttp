@@ -1,0 +1,25 @@
+The program crashed because of an access violation reading location 0xffffffffffffffff.
+
+Printing the stack trace:
+handle_exception                  C:\jai\modules\Runtime_Support_Crash_Handler.jai:361
+... (skipping OS-internal procedures)
+allocate_small                    C:\jai\modules\Default_Allocator\module.jai:1299
+allocate                          C:\jai\modules\Default_Allocator\module.jai:1471
+allocator_proc                    C:\jai\modules\Default_Allocator\module.jai:38
+alloc                             C:\jai\modules\Basic\module.jai:109
+alloc_string                      C:\jai\modules\Basic\module.jai:163
+copy_string                       C:\jai\modules\Basic\Simple_String.jai:109
+iterate_post                      C:\Users\Kuju\Projects\KodaMicroHttp\module.jai:851
+MHD_create_response_for_upgrade   unknown:0
+MHD_post_process                  unknown:0
+server_respond                    C:\Users\Kuju\Projects\KodaMicroHttp\module.jai:752
+MHD_queue_response                unknown:0
+MHD_get_reason_phrase_len_for     unknown:0
+MHD_resume_connection             unknown:0
+beginthreadex                     unknown:0
+endthreadex                       unknown:0
+BaseThreadInitThunk               unknown:0
+RtlUserThreadStart                unknown:0
+
+
+            existing_entry.name = copy_string(key_string);

@@ -2,18 +2,11 @@
 HttpServer :: struct {
     port: u16;
     timeout_seconds: int;
-    thread_count: int;
     daemon: *MHD_Daemon;
     handlers: [http_method_count] HttpHandler;
-    // optional_handlers: [http_method_count] [..] HttpHandlerWithOptions;
     fallback_handlers: [http_method_count] InternalRequestHandler;
-    // fallback_handlers_with_options: [http_method_count] RequestHandlerWithOptions;
     extra_headers: [] [2] *u8;
-    // once this is flipped to true we'll no longer lock the mutex since the table will never again change
-    threads_propagated: bool;
-    // thread_contexts_mutex: Mutex;
-    // thread_contexts: Table(u64, Context);
-    // allocator: Allocator;
+
 }
 
 // RequestHandlerWithOptions :: struct {
@@ -85,14 +78,10 @@ HttpMemoryMode :: enum u16 {
 InternalRequestHandler :: #type (request: *HttpRequest, response: *HttpResponse, optionals: [] string) -> HttpResult;
 // RequestHandlerWithOptions :: #type (request: *HttpRequest, response: *HttpResponse, path_fields: ..string) -> HttpResult;
 
-create_server :: (port: u16, timeout_seconds: int = 60, thread_count: int = core_count) -> *HttpServer {
+create_server :: (port: u16, timeout_seconds: int = 60) -> *HttpServer {
     server := New(HttpServer);
     server.port = port;
     server.timeout_seconds = timeout_seconds;
-    server.thread_count = thread_count;
-    // server.allocator = context.allocator;
-
-    // init(*server.thread_contexts_mutex);
 
     if !static_buffer_mutex_init {
         static_buffer_mutex_init = true;
@@ -122,8 +111,6 @@ server_listen :: (server: *HttpServer) {
 }
 
 server_listen_async :: (server: *HttpServer) -> bool {
-    // init(*server.thread_contexts, server.thread_count);
-
     server.daemon = MHD_start_daemon(
         cast(u32) MHD_FLAG.MHD_USE_THREAD_PER_CONNECTION,
         server.port,
@@ -146,12 +133,6 @@ server_stop :: (server: *HttpServer) {
     print("Stopping server on port %.\n", server.port);
 
     MHD_stop_daemon(server.daemon);
-
-    // for thread_context, thread_id: server.thread_contexts {
-    //     free_thread_context(server, thread_context);
-    // }
-    // deinit(*server.thread_contexts);
-    server.threads_propagated = false;
 }
 
 // this method accepts your handler, and it bakes it inside a compile time method that automatically unwraps an array
@@ -259,6 +240,7 @@ reply :: (response: *HttpResponse, status: u16) -> HttpResult {
     return reply(response, status, .[], null);
 }
 
+// the docs say that the headers are duplicated into memory blocks held by response
 reply :: (response: *HttpResponse, status: u16, extra_headers: [] [2] *u8, body: string, memory_mode: HttpMemoryMode) -> HttpResult {
     // assert(body.count == 0 || body[body.count - 1] == #char "\0", "Your body must either be null or must end with a null character.");
     if body.count > 0 && body[body.count - 1] != #char "\0" {
@@ -284,6 +266,10 @@ reply :: (response: *HttpResponse, status: u16, extra_headers: [] [2] *u8, body:
     }
 
     return inline reply(response, status, extra_headers, body.data, max(0, body.count - 1), memory_mode);
+}
+
+reply :: (response: *HttpResponse, status: u16, extra_headers: [] [2] *u8) -> HttpResult {
+    return inline reply(response, status, extra_headers, null, .Static);
 }
 
 reply :: (response: *HttpResponse, status: u16, extra_headers: [] [2] *u8, $body: *u8) -> HttpResult {
@@ -596,82 +582,7 @@ get_next_path_part :: (path: string, index: int) -> string, int {
     return part, index + count;
 }
 
-// get_thread_context :: (server: *HttpServer) -> Context #c_call {
-//     push_context global_http_context {
-//         // context.allocator = server.allocator;
-
-//         thread_id := get_thread_id();
-//         print("Getting thread %\n", thread_id);
-
-//         print("Server %\n", server);
-//         // print("Propagated %\n", *server.threads_propagated);
-//         // print("Propagated %\n", server.threads_propagated);
-//         threads_propagated := server.threads_propagated;
-//         if !threads_propagated {
-//             lock(*server.thread_contexts_mutex);
-//         }
-
-//         print("Table pointer address %\n", *server.thread_contexts);
-
-//         thread_context_pointer := table_find_pointer(*server.thread_contexts, thread_id);
-//         if !thread_context_pointer {
-//             thread_context_pointer = table_add(*server.thread_contexts, thread_id, create_thread_context(server, thread_id));
-//         }
-
-//         if !threads_propagated {
-//             threads_propagated = server.thread_contexts.count >= server.thread_count;
-//             unlock(*server.thread_contexts_mutex);
-//         }
-
-//         return thread_context_pointer.*;
-//     }
-// }
-
-// create_thread_context :: (server: *HttpServer, thread_id: u64) -> Context {
-//     truncated_thread_id: u32;
-//     truncated_thread_id = (cast(u32) (thread_id & 0xffffffff)) ^ (cast(u32) ((thread_id >> 32) & 0xffffffff));
-
-//     temporary_storage_size := 16384;
-
-//     thread_context: Context;
-//     thread_context.thread_index = truncated_thread_id;
-//     thread_context.base.context_info = type_info(Context);
-//     // thread_context.allocator = server.allocator;
-//     #if OS == .WINDOWS {
-//         thread_context.allocator.proc(.THREAD_START, 0, 0, null, thread_context.allocator.data);
-//     }
-//     thread_context.temporary_storage = New(Temporary_Storage);
-//     set_initial_data(thread_context.temporary_storage, temporary_storage_size, alloc(temporary_storage_size));
-//     push_context thread_context {
-//         random_seed(get_unix_time());
-//     }
-
-//     return thread_context;
-// }
-
-// free_thread_context :: (server: *HttpServer, thread_context: Context) {
-//     push_context global_http_context {
-//         // context.allocator = server.allocator;
-
-//         print("Freeing thread context. It should probably never do this.\n");
-
-//         #if OS == .WINDOWS {
-//             thread_context.allocator.proc(.THREAD_STOP, 0, 0, null, thread_context.allocator.data);
-//         }
-
-//         free(thread_context.temporary_storage.original_data);
-
-//         overflow := thread_context.temporary_storage.overflow_pages;
-//         while overflow {
-//             next := overflow.next;
-//             free(overflow);
-//             overflow = next;
-//         }
-
-//         free(thread_context.temporary_storage);
-//     }
-// }
-
+// TODO if I want to optimize this I should keep unused contexts in an empty buffer
 create_context :: () -> Context #c_call {
     empty_context: Context;
     push_context empty_context {
@@ -697,8 +608,6 @@ create_context :: () -> Context #c_call {
 free_context :: (thread_context: Context) #c_call {
     empty_context: Context;
     push_context empty_context {
-        free(thread_context.temporary_storage.original_data);
-
         overflow := thread_context.temporary_storage.overflow_pages;
         while overflow {
             next := overflow.next;
@@ -789,13 +698,10 @@ get_http_method :: (method: string) -> HttpMethod {
 server_respond :: (cls: *void, connection: *MHD_Connection, url: *u8, method: *u8, version: *u8, upload_data: *u8, upload_data_size: *u64, req_cls: **void) -> MHD_Result #c_call {
     request_time := get_unix_time();
     server := cast(*HttpServer) cls;
-    // thread_context := get_thread_context(server);
-    // new_context: Context;
     thread_context := create_context();
     defer free_context(thread_context);
 
     push_context thread_context {
-
         url_string := to_string(url);
         method_string := to_string(method);
         http_method := get_http_method(method_string);
@@ -919,7 +825,7 @@ server_respond :: (cls: *void, connection: *MHD_Connection, url: *u8, method: *u
     }
 }
 
-iterate_post :: (cls: *void, kind: MHD_ValueKind, key: *u8, filename: *u8, content_type: *u8, transfer_encoding: *u8, data: *u8, off: u64, size: size_t) -> MHD_Result #c_call {
+iterate_post :: (cls: *void, kind: MHD_ValueKind, key: *u8, filename: *u8, content_type: *u8, transfer_encoding: *u8, data: *u8, off: u64, size: u64) -> MHD_Result #c_call {
     http_request := cast(*HttpRequest) cls;
 
     new_context: Context;
@@ -1009,7 +915,7 @@ get_unix_time :: () -> u64 #c_call {
         #import "POSIX";
 
         t: timespec;
-        clock_gettime(CLOCK_REALTIME, *t);
+        clock_gettime(.CLOCK_REALTIME, *t);
         micros: s64 = t.tv_sec * 1000000;
         /* Add full microseconds */
         micros += t.tv_nsec / 1000;
